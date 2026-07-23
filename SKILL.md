@@ -2,17 +2,22 @@
 name: a-stock-data
 description: 当任务需要写代码实际获取A股数据时使用——拉取行情/K线(mootdx+腾讯+百度)、研报(东财+同花顺+iwencai)、信号(热点/北向/龙虎榜/解禁/行业)、资金面(融资融券/大宗/股东户数/分红/资金流)、新闻、财务三表/F10、公告(巨潮)、打板(涨停池/连板/炸板率)、ETF期权(T型报价/希腊字母/IV)、舆情互动(互动易/热榜/人气榜)等真实数据。十层数据源·43端点(含3官方备胎)·内嵌全部可运行代码，自包含零依赖外部文件；优先用通达信(mootdx)/腾讯(不封IP)，东财接口已内置限流防封，主源被封可查「备用源速查」降级。仅在需要调用数据接口取数时使用：A股概念解释、投资观点讨论、策略问答等无需取数的话题不要加载本skill。
 origin: custom
-version: 3.4.0
+version: 3.4.1
 ---
 
 > 📦 项目主页：https://github.com/simonlin1212/a-stock-data — 更新、反馈、支持作者
 > 
 > 作者：Simon 林 · 抖音「Simon林」· 公众号「硅基世纪」
 
-# A股全栈数据工具包 V3.4.0
+# A股全栈数据工具包 V3.4.1
 
 十层数据架构，43 个端点实测可用（40 主端点 + 3 官方备胎，2026-07 验证），覆盖主板/中小板/科创板/ST。每类数据在「备用源速查」列有独立备胎，主源被封时可降级。
 
+> **V3.4.1（前缀路由 + mootdx 验活修复，2026-07-23）：**
+> - **§1.2/§市场前缀规则 前缀路由修复（#40 #41）**：`5` 开头沪市 ETF（`510300`/`588200` 等）、沪深指数（`000300`/`000016` 等）此前落到 `else → sz`，腾讯接口返回空**或错票**（`000016` 被误判为 `sz000016` *ST康佳A，静默返回不相干标的的数据，比返空更危险）。`get_prefix()` 与 `tencent_quote()` 两处同步修复：`5x→sh`、沪指数白名单、支持显式前缀（`sh000001`/`sz000001`）透传解决 `000001`（上证指数 vs 平安银行）歧义。
+> - **§1.1 `tdx_client()` 真实取数验活（#43）**：`_probe()` 仅做 TCP 握手，握手成功 ≠ 能取数——坏服务器可握手通过却回 2 字节空 body，导致**静默返回空 DataFrame 或连接崩溃**且走不到 fallback。新增 `_validate()`：每个候选 server 必须真实拉一根 K 线成功才采用，并对 `factory()` 连接异常做 try/except 跳过，全部失败才抛明确错误。
+> - **备用源速查 K线行新增腾讯 m5 分钟 K 线（#43）**：同花顺 K 线备胎只有 30/60 分，mootdx 一挂就无 5 分钟源。补腾讯 `ifzq.gtimg.cn` 分钟 K（m1/m5/m15/m30/m60，零鉴权不封 IP）。⚠️ 第 7 字段是**换手率基点**不是成交额（差 3 个数量级），成交额需自算。
+>
 > **V3.4.0（接口质量 + 备用源韧性，2026-07-11）：**
 > - **§5.2 财联社快讯复活**：旧 nodeapi 2026-05 下线后，改走官方 `v1/roll/get_roll_list` + 本地签名（`sign=md5(sha1(排序query))`，零 key），V3.2 移除的全市场电报能力恢复，与东财 7×24 互为独立备份。实测 errno=0。
 > - **新增「备用源速查 & 降级策略」章节**：十层主源→独立备胎速查表（不同域名/不同风控面）+ 3 个实测备胎函数——`dragon_tiger_backup()`（沪深交易所官方龙虎榜，含营业部席位）、`fund_flow_backup()`（新浪日度资金流）、`announcements_backup()`（深市深交所官方/沪市东财公告+PDF）。端点 40 → 43，数据源 13 → 15（新增沪深交易所官方）。
@@ -278,36 +283,50 @@ _TDX_SERVERS = [
 ]
 
 def _probe(ip, port, timeout=2.0):
-    """TCP 握手探测，判断服务器是否可达"""
+    """TCP 握手探测（快速粗筛）。注意：握手成功 ≠ 能取数，必须再经 _validate 验活。"""
     try:
         with socket.create_connection((ip, port), timeout=timeout):
             return True
     except Exception:
         return False
 
+def _validate(client) -> bool:
+    """真实取数验活：坏服务器可 TCP 握手通过却回 2 字节空 body → 静默空表。用一次真实 K 线请求兜底。"""
+    try:
+        df = client.bars(symbol='000001', frequency=9, offset=1)
+        return df is not None and not df.empty
+    except Exception:
+        return False
+
 def tdx_client(market='std'):
     """
-    创建 mootdx 客户端，规避 0.11.x BESTIP.HQ 空串 bug。
-    顺序兜底，保证 IP 列表老化/换网时仍能工作：
-      1) 顺序探测 _TDX_SERVERS，用第一个 TCP 可达的显式 server；
-      2) 全部不可达 → 回退 mootdx 自带 bestip 测速选优；
-      3) 再不行 → 回退裸 factory（老用户 config 已有可用 BESTIP 时成立）；
-      4) 仍失败 → 抛 RuntimeError，明确报错而非死等。
+    创建 mootdx 客户端，规避 0.11.x BESTIP.HQ 空串 bug + 坏服务器静默空表（#43）。
+    每个候选都必须「真实取数验活」通过才采用（_probe TCP 握手是假阳性来源）：
+      1) 顺序探测 _TDX_SERVERS，对 probe 通过者再 _validate 真实取数，取第一个验活成功的；
+      2) 全部失败 → 回退 mootdx 自带 bestip 测速选优（同样验活）；
+      3) 再回退裸 factory（老用户 config 已有可用 BESTIP 时成立）；
+      4) 仍失败 → 抛 RuntimeError，明确报错而非静默返回空表 / 崩溃。
     """
     for ip, port in _TDX_SERVERS:
-        if _probe(ip, port):
-            return Quotes.factory(market=market, server=(ip, port))
-    try:
-        return Quotes.factory(market=market, bestip=True)   # fallback 1
-    except Exception:
-        pass
-    try:
-        return Quotes.factory(market=market)                # fallback 2
-    except Exception as e:
-        raise RuntimeError(
-            "所有 mootdx 服务器均不可达。海外网络通常全部超时（TCP 7709），"
-            "请走国内代理或更新 _TDX_SERVERS 列表。原始错误：%s" % e
-        )
+        if not _probe(ip, port):
+            continue
+        try:
+            c = Quotes.factory(market=market, server=(ip, port))
+            if _validate(c):
+                return c
+        except Exception:
+            continue                                        # 握手过但取数崩 → 跳过下一台
+    for kwargs in ({'bestip': True}, {}):                   # fallback: bestip 测速 / 裸 factory
+        try:
+            c = Quotes.factory(market=market, **kwargs)
+            if _validate(c):
+                return c
+        except Exception:
+            continue
+    raise RuntimeError(
+        "所有 mootdx 服务器均无法取到数据（TCP 可达但返回空 / 被 reset）。"
+        "海外网络通常全部超时（TCP 7709），请走国内代理或更新 _TDX_SERVERS 列表。"
+    )
 
 # 用法：client = tdx_client()   # 替代所有 Quotes.factory(market='std')
 ```
@@ -317,15 +336,24 @@ def tdx_client(market='std'):
 ### 市场前缀规则（全局通用）
 
 ```python
+# 沪市指数白名单：与深市 000xxx 个股同段，需白名单区分（沪深300/上证50/中证500/科创50/中证1000/上证180）
+SH_INDEX = {"000300", "000905", "000016", "000688", "000852", "000010"}
+
 def get_prefix(code: str) -> str:
-    """6位代码 → 市场前缀"""
-    if code.startswith(("6", "9")):
+    """6位代码 → 市场前缀（sh/sz/bj）。支持显式前缀 sh/sz/bj 透传以解决歧义。"""
+    c = code.lower()
+    if c.startswith(("sh", "sz", "bj")):     # 显式前缀透传（如 sh000001=上证指数 vs sz000001=平安银行）
+        return c[:2]
+    if c.startswith(("5", "6", "9")):        # 5x=沪 ETF/LOF，6/9=沪个股
         return "sh"
-    elif code.startswith("8"):
+    if c.startswith(("4", "8")):             # 4x/8x=北交所
         return "bj"
-    else:
-        return "sz"
+    if c in SH_INDEX:                         # 沪深300/上证50 等沪指数（000xxx）
+        return "sh"
+    return "sz"                              # 深市个股/ETF（00/30/15x/16x/159 等），深指数 399xxx 亦走 sz
 ```
+
+> **歧义说明：** `000001` 默认按个股→`sz000001`（平安银行）；要上证指数请显式传 `sh000001`。`000016` 默认按沪指数→上证50；要深康佳A 请传 `sz000016`。
 
 ### Ticker 格式归一化
 
@@ -457,11 +485,16 @@ def tencent_quote(codes: list[str]) -> dict[str, dict]:
     也支持ETF: ["510050", "510300"]
     返回: {code: {name, price, pe_ttm, pb, mcap, ...}}
     """
+    # 前缀路由：与全局 get_prefix() 一致。5x 沪ETF / 000300 等沪指数不能落到 sz（会返回空或错票）。
+    SH_INDEX = {"000300", "000905", "000016", "000688", "000852", "000010"}   # 沪指数白名单
     prefixed = []
     for c in codes:
-        if c.startswith(("6", "9")):
+        low = c.lower()
+        if low.startswith(("sh", "sz", "bj")):        # 显式前缀透传，解决 000001 等歧义
+            prefixed.append(low)
+        elif c in SH_INDEX or c.startswith(("5", "6", "9")):
             prefixed.append(f"sh{c}")
-        elif c.startswith("8"):
+        elif c.startswith(("4", "8")):
             prefixed.append(f"bj{c}")
         else:
             prefixed.append(f"sz{c}")
@@ -2656,6 +2689,7 @@ if holders:
 |---|---|---|---|
 | 实时行情+五档 | mootdx/腾讯 | 交易所官方 | 沪 `yunhq.sse.com.cn:32041/v1/sh1/snap/{code}`、深 `szse.cn/api/market/ssjjhq/getTimeData?marketId=1&code={code}`（一手五档） |
 | K线(全历史) | mootdx/百度/腾讯 | 同花顺 | `d.10jqka.com.cn/v6/line/hs_{code}/01/last.js`（01日/11周/21月/30/60分；2001至今；JSONP剥壳） |
+| K线(分钟) | mootdx | 腾讯 | `ifzq.gtimg.cn/appstock/app/kline/mkline?param={pre}{code},m5,,320`（m1/m5/m15/m30/m60，≤320根，需头 `Referer: https://gu.qq.com/`；mootdx 一挂时唯一的 5 分钟源）|
 | 龙虎榜 | 东财 datacenter | 沪深交易所官方 | `dragon_tiger_backup()`（见下，含营业部席位） |
 | 个股资金流 | 东财 push2 | 新浪 | `fund_flow_backup()`（见下，日度四档单净额） |
 | 公告 | 巨潮 | 深交所官方/东财 | `announcements_backup()`（见下，深市深交所+PDF，沪市东财+PDF） |
@@ -2666,6 +2700,8 @@ if holders:
 | 北向(权威) | 同花顺 hexin | HKEX 官方 | `hkex.com.hk/chi/csm/DailyStat/data_tab_daily_{YYYYMMDD}c.js`（成交额/额度/十大活跃股） |
 
 > ⛔ **已死透别用**（2026-07 实测）：网易财经(126.net 整站下线)、和讯、凤凰行情、腾讯资金流(ff_ 已死)、雪球免登录深度数据(需 token)。mootdx **库**已烂尾(2024 停更)但**通达信 TCP 协议本身照常**——继续用，装不上就用 `tdx_client()`。
+>
+> ⚠️ **腾讯分钟 K 线字段坑**：返回数组 `[时间, 开, 收, 高, 低, 量(手), {}, 换手率基点]`——第 7 个字段**不是成交额，是换手率基点**（当日各根累加 ÷100 = 当日换手率%）。当成交额读会小三个数量级；成交额需自算 `量(手) × 100 × 均价`。
 
 ```python
 import json, urllib.request, ssl
